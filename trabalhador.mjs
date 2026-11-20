@@ -34,7 +34,7 @@ function conectar() {
 }
 
 async function escritoriosParaRodar(c) {
-  return (await c.query("select escritorio_id from pje_certificados where status in ('pendente','ativo') order by atualizado_em")).rows.map((r) => r.escritorio_id);
+  return (await c.query("select escritorio_id from pje_certificados where status in ('pendente','ativo','erro') order by atualizado_em")).rows.map((r) => r.escritorio_id);
 }
 async function lerCertificado(c, esc) {
   const r = (await c.query("select integracao_segredo_ler($1,'pje_pfx') pfx, integracao_segredo_ler($1,'pje_senha') senha", [esc])).rows[0] || {};

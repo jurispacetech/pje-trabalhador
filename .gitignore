@@ -1,0 +1,5 @@
+node_modules/
+saida/
+*.pfx
+*.p12
+.env

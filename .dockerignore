@@ -1,0 +1,8 @@
+node_modules
+agente.mjs
+cadastrar.mjs
+trabalhador-*.local*
+saida/
+*.pfx
+*.p12
+.env

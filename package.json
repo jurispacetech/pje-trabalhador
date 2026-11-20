@@ -1,0 +1,14 @@
+{
+  "name": "pje-trabalhador",
+  "private": true,
+  "type": "module",
+  "description": "Trabalhador do PJe (Movimentações da JulIA) — roda no servidor brasileiro",
+  "scripts": {
+    "start": "node trabalhador.mjs"
+  },
+  "dependencies": {
+    "pg": "8.13.1",
+    "node-cron": "3.0.3",
+    "playwright": "1.48.0"
+  }
+}

@@ -80,14 +80,17 @@ async function logar(a1, totpConf) {
   pagina.on('request', (r) => { const h = r.headers()['authorization']; if (!cap.bearer && h && r.url().includes('/api/v2/')) cap.bearer = h; });
   try {
     await pagina.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // O botão "Seu certificado digital" chama autenticar(...) tanto na tela antiga (#kc-pje-office)
+    // quanto na nova (Portal Jus.br): casa pelo onclick, que é o que dispara o assinador.
+    const SELETOR_CERT = '[onclick^="autenticar("], #kc-pje-office';
     try {
-      await pagina.waitForSelector('#kc-pje-office', { timeout: 30000 });
+      await pagina.waitForSelector(SELETOR_CERT, { timeout: 30000 });
     } catch {
       const url = pagina.url(); const titulo = await pagina.title().catch(() => '');
       const txt = await pagina.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
       throw new Error(`login não carregou o botão. URL=${url} título="${titulo}" texto="${String(txt).replace(/\s+/g, ' ').slice(0, 500)}"`);
     }
-    await pagina.click('#kc-pje-office');
+    await pagina.click(SELETOR_CERT);
     const inicio = Date.now(); let totpFeito = false;
     while (Date.now() - inicio < 180000) {
       await pagina.waitForTimeout(1500);

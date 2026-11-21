@@ -22,10 +22,10 @@ import { codigoTotp, segundosRestantes } from './totp.mjs';
 const LOGIN_URL = 'https://sso.cloud.pje.jus.br/auth/realms/pje/protocol/openid-connect/auth?client_id=jusbr&scope=openid&redirect_uri=https://www.jus.br&response_type=code';
 const CONSULTA_URL = 'https://portaldeservicos.pdpj.jus.br/consulta-processual';
 const API_PROCESSOS = 'https://portaldeservicos.pdpj.jus.br/api/v2/processos';
-// Fluxo OAuth2 oficial do SSO (Keycloak, realm pje): o mesmo cliente público do login (jusbr).
+// Fluxo OAuth2 oficial do SSO (Keycloak, realm pje). Clientes públicos, na ordem de preferência: o do Portal de
+// Serviços (é o token que a API /api/v2 aceita; config pública em /assets/config/env.js) e, de reserva, o do login.
 const SSO_OIDC = 'https://sso.cloud.pje.jus.br/auth/realms/pje/protocol/openid-connect';
-const OIDC_CLIENT = 'jusbr';
-const OIDC_REDIRECT = 'https://www.jus.br';
+const OIDC_CLIENTES = [['portalexterno-frontend', 'https://portaldeservicos.pdpj.jus.br'], ['jusbr', 'https://www.jus.br']];
 const LIMITE = Number(process.env.PJE_LIMITE || 8);
 const PADRAO_PJE = /pdpj|pj-?e|jus\.?br/i;
 
@@ -190,29 +190,35 @@ async function logar(a1, totpConf, certNav, numeros = []) {
       // (é o mesmo fluxo que o portal faz por baixo). Não passamos pela tela do Portal de Serviços — ela devolve 403
       // ao navegador automatizado, e a API em si responde normalmente (sem token dá 401). O contexto.request usa os
       // MESMOS cookies do navegador; com maxRedirects:0 o "code" vem no cabeçalho Location.
+      // Para QUEM pedimos o token importa: a API do Portal de Serviços aceita o token do cliente que o próprio
+      // portal usa (config pública em /assets/config/env.js: clientId "portalexterno-frontend"). O cliente do
+      // login (jusbr) fica de reserva — o token dele sai com aud=["broker","account"] e a API o recusa.
       const b64url = (b) => Buffer.from(b).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-      const verificador = b64url(crypto.randomBytes(32));
-      const desafio = b64url(crypto.createHash('sha256').update(verificador).digest());
-      const estado = b64url(crypto.randomBytes(12));
-      const urlAuth = `${SSO_OIDC}/auth?client_id=${OIDC_CLIENT}&redirect_uri=${encodeURIComponent(OIDC_REDIRECT)}&response_type=code&scope=openid&state=${estado}&code_challenge=${desafio}&code_challenge_method=S256`;
-      let codigo = null;
-      try {
-        const r = await contexto.request.get(urlAuth, { maxRedirects: 0, timeout: 30000 });
-        const loc = r.headers()['location'] || '';
-        try { codigo = new URL(loc, OIDC_REDIRECT).searchParams.get('code'); } catch { /* sem location */ }
-        if (!codigo) log(`  SSO não devolveu code: HTTP ${r.status()} location="${loc.slice(0, 160)}" corpo="${(await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200)}"`);
-      } catch (e) { log('  pedido de autorização ao SSO falhou: ' + e.message); }
-      if (codigo) {
-        const corpo = new URLSearchParams({ grant_type: 'authorization_code', client_id: OIDC_CLIENT, redirect_uri: OIDC_REDIRECT, code: codigo, code_verifier: verificador });
+      const tokenViaSso = async (cliente, redirect) => {
+        const verificador = b64url(crypto.randomBytes(32));
+        const desafio = b64url(crypto.createHash('sha256').update(verificador).digest());
+        const estado = b64url(crypto.randomBytes(12));
+        const urlAuth = `${SSO_OIDC}/auth?client_id=${encodeURIComponent(cliente)}&redirect_uri=${encodeURIComponent(redirect)}&response_type=code&scope=openid&state=${estado}&code_challenge=${desafio}&code_challenge_method=S256`;
+        let codigo = null;
+        try {
+          const r = await contexto.request.get(urlAuth, { maxRedirects: 0, timeout: 30000 });
+          const loc = r.headers()['location'] || '';
+          try { const u = new URL(loc, redirect); codigo = u.searchParams.get('code') || new URLSearchParams(u.hash.slice(1)).get('code'); } catch { /* sem location */ }
+          if (!codigo) { log(`  [${cliente}] SSO não devolveu code: HTTP ${r.status()} location="${loc.slice(0, 160)}" corpo="${(await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 160)}"`); return null; }
+        } catch (e) { log(`  [${cliente}] pedido de autorização ao SSO falhou: ` + e.message); return null; }
+        const corpo = new URLSearchParams({ grant_type: 'authorization_code', client_id: cliente, redirect_uri: redirect, code: codigo, code_verifier: verificador });
         try {
           const r = await fetch(`${SSO_OIDC}/token`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' }, body: corpo });
           const txt = await r.text().catch(() => '');
           let j = {}; try { j = JSON.parse(txt); } catch { /* não era JSON */ }
-          if (r.ok && j.access_token) {
-            cap.bearer = 'Bearer ' + j.access_token; cap.origem = 'SSO (authorization_code + PKCE)';
-            try { const p = JSON.parse(Buffer.from(j.access_token.split('.')[1], 'base64url').toString()); log(`  token: aud=${JSON.stringify(p.aud)} azp=${p.azp} scope="${p.scope}" expira em ${Math.round((p.exp * 1000 - Date.now()) / 60000)} min`); } catch { /* sem claims legíveis */ }
-          } else log(`  troca do code por token falhou: HTTP ${r.status} ${txt.replace(/\s+/g, ' ').slice(0, 200)}`);
-        } catch (e) { log('  troca do code por token falhou: ' + e.message); }
+          if (!(r.ok && j.access_token)) { log(`  [${cliente}] troca do code por token falhou: HTTP ${r.status} ${txt.replace(/\s+/g, ' ').slice(0, 160)}`); return null; }
+          try { const p = JSON.parse(Buffer.from(j.access_token.split('.')[1], 'base64url').toString()); log(`  [${cliente}] token: aud=${JSON.stringify(p.aud)} azp=${p.azp} scope="${p.scope}" expira em ${Math.round((p.exp * 1000 - Date.now()) / 60000)} min`); } catch { /* sem claims legíveis */ }
+          return 'Bearer ' + j.access_token;
+        } catch (e) { log(`  [${cliente}] troca do code por token falhou: ` + e.message); return null; }
+      };
+      for (const [cliente, redirect] of OIDC_CLIENTES) {
+        const b = await tokenViaSso(cliente, redirect);
+        if (b) { cap.bearer = b; cap.origem = `SSO (authorization_code + PKCE, cliente ${cliente})`; break; }
       }
       // Alternativas: um bearer visto em outra chamada *.jus.br, ou um token que o jus.br guardou no navegador.
       if (!cap.bearer && cap.qualquer) { cap.bearer = cap.qualquer.h; cap.origem = cap.qualquer.u + ' (não era /api/)'; }

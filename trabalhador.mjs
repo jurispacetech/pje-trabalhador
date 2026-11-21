@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import pg from 'pg';
 import cron from 'node-cron';
 import { chromium } from 'playwright';
@@ -21,6 +22,10 @@ import { codigoTotp, segundosRestantes } from './totp.mjs';
 const LOGIN_URL = 'https://sso.cloud.pje.jus.br/auth/realms/pje/protocol/openid-connect/auth?client_id=jusbr&scope=openid&redirect_uri=https://www.jus.br&response_type=code';
 const CONSULTA_URL = 'https://portaldeservicos.pdpj.jus.br/consulta-processual';
 const API_PROCESSOS = 'https://portaldeservicos.pdpj.jus.br/api/v2/processos';
+// Fluxo OAuth2 oficial do SSO (Keycloak, realm pje): o mesmo cliente público do login (jusbr).
+const SSO_OIDC = 'https://sso.cloud.pje.jus.br/auth/realms/pje/protocol/openid-connect';
+const OIDC_CLIENT = 'jusbr';
+const OIDC_REDIRECT = 'https://www.jus.br';
 const LIMITE = Number(process.env.PJE_LIMITE || 8);
 const PADRAO_PJE = /pdpj|pj-?e|jus\.?br/i;
 
@@ -181,55 +186,45 @@ async function logar(a1, totpConf, certNav, numeros = []) {
       if (new URL(pagina.url()).hostname === 'sso.cloud.pje.jus.br') throw new Error('não passou do login em 3 min. ' + await diagnostico());
       log('  passou do login → ' + pagina.url().slice(0, 120));
 
-      // Portal de Serviços do PDPJ: entra com a sessão do SSO (mesmo realm) e pega o bearer que a tela usa na API.
-      const noPdpj = () => { try { return /pdpj\.jus\.br$/.test(new URL(pagina.url()).hostname); } catch { return false; } };
-      const esperarPortal = async () => {
-        for (let i = 0; i < 20 && !noPdpj(); i++) await pagina.waitForTimeout(1500); // ida e volta pelo SSO
-        await pagina.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-      };
-      await pagina.goto(CONSULTA_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      await esperarPortal();
-      log('  portal PDPJ: ' + await diagnostico());
-      // Se o portal mostrar um botão de entrar, clica (o SSO completa sozinho).
-      if (!cap.bearer) {
-        const entrar = (await acharVisivel(pagina.getByRole('button', { name: /^(entrar|acessar|login|fazer login)/i })))
-          || (await acharVisivel(pagina.getByRole('link', { name: /^(entrar|acessar|login)/i })));
-        if (entrar) {
-          log('  clicando em Entrar no portal…');
-          await entrar.click({ timeout: 5000, noWaitAfter: true }).catch(() => {});
-          await pagina.waitForTimeout(4000); await esperarPortal();
-          log('  portal PDPJ depois de Entrar: ' + await diagnostico());
-        }
+      // Token pela porta oficial: fluxo OAuth2 authorization_code + PKCE contra o SSO, cuja sessão já está aberta
+      // (é o mesmo fluxo que o portal faz por baixo). Não passamos pela tela do Portal de Serviços — ela devolve 403
+      // ao navegador automatizado, e a API em si responde normalmente (sem token dá 401). O contexto.request usa os
+      // MESMOS cookies do navegador; com maxRedirects:0 o "code" vem no cabeçalho Location.
+      const b64url = (b) => Buffer.from(b).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const verificador = b64url(crypto.randomBytes(32));
+      const desafio = b64url(crypto.createHash('sha256').update(verificador).digest());
+      const estado = b64url(crypto.randomBytes(12));
+      const urlAuth = `${SSO_OIDC}/auth?client_id=${OIDC_CLIENT}&redirect_uri=${encodeURIComponent(OIDC_REDIRECT)}&response_type=code&scope=openid&state=${estado}&code_challenge=${desafio}&code_challenge_method=S256`;
+      let codigo = null;
+      try {
+        const r = await contexto.request.get(urlAuth, { maxRedirects: 0, timeout: 30000 });
+        const loc = r.headers()['location'] || '';
+        try { codigo = new URL(loc, OIDC_REDIRECT).searchParams.get('code'); } catch { /* sem location */ }
+        if (!codigo) log(`  SSO não devolveu code: HTTP ${r.status()} location="${loc.slice(0, 160)}" corpo="${(await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200)}"`);
+      } catch (e) { log('  pedido de autorização ao SSO falhou: ' + e.message); }
+      if (codigo) {
+        const corpo = new URLSearchParams({ grant_type: 'authorization_code', client_id: OIDC_CLIENT, redirect_uri: OIDC_REDIRECT, code: codigo, code_verifier: verificador });
+        try {
+          const r = await fetch(`${SSO_OIDC}/token`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' }, body: corpo });
+          const txt = await r.text().catch(() => '');
+          let j = {}; try { j = JSON.parse(txt); } catch { /* não era JSON */ }
+          if (r.ok && j.access_token) {
+            cap.bearer = 'Bearer ' + j.access_token; cap.origem = 'SSO (authorization_code + PKCE)';
+            try { const p = JSON.parse(Buffer.from(j.access_token.split('.')[1], 'base64url').toString()); log(`  token: aud=${JSON.stringify(p.aud)} azp=${p.azp} scope="${p.scope}" expira em ${Math.round((p.exp * 1000 - Date.now()) / 60000)} min`); } catch { /* sem claims legíveis */ }
+          } else log(`  troca do code por token falhou: HTTP ${r.status} ${txt.replace(/\s+/g, ' ').slice(0, 200)}`);
+        } catch (e) { log('  troca do code por token falhou: ' + e.message); }
       }
-      // Dispara uma pesquisa para a tela chamar a API (é nessa chamada que vai o bearer).
-      if (!cap.bearer && numeros.length) {
-        const campos = pagina.locator('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"])');
-        const n = await campos.count().catch(() => 0); let campo = null;
-        for (let i = 0; i < n && !campo; i++) {
-          const el = campos.nth(i); if (!(await el.isVisible().catch(() => false))) continue;
-          const attrs = await comTempo(el.evaluate((e) => [e.placeholder, e.name, e.id, e.getAttribute('formcontrolname'), e.getAttribute('aria-label')].join(' ')), 3000, '');
-          if (/process|n[úu]mero|cnj|pesquis|busca|consult/i.test(attrs)) campo = el;
-        }
-        if (!campo) for (let i = 0; i < n && !campo; i++) { const el = campos.nth(i); if (await el.isVisible().catch(() => false)) campo = el; }
-        if (campo) {
-          log('  pesquisando o processo ' + numeros[0] + '…');
-          await campo.fill(numeros[0]).catch(() => {}); await campo.press('Enter').catch(() => {});
-          const btn = await acharVisivel(pagina.getByRole('button', { name: /pesquisar|buscar|consultar/i }));
-          if (btn) await btn.click({ timeout: 5000, noWaitAfter: true }).catch(() => {});
-        } else log('  nenhum campo de pesquisa visível no portal');
-        for (let i = 0; i < 40 && !cap.bearer; i++) await pagina.waitForTimeout(1000);
-      }
-      // Alternativas: um bearer de outra chamada *.jus.br, ou o token que o app guarda no navegador (JWT começa com "eyJ").
+      // Alternativas: um bearer visto em outra chamada *.jus.br, ou um token que o jus.br guardou no navegador.
       if (!cap.bearer && cap.qualquer) { cap.bearer = cap.qualquer.h; cap.origem = cap.qualquer.u + ' (não era /api/)'; }
       if (!cap.bearer) {
         const jwt = await comTempo(pagina.evaluate(() => {
           const acha = (s) => { for (let i = 0; i < s.length; i++) { const v = s.getItem(s.key(i)) || ''; const m = v.match(/eyJ[\w-]+\.eyJ[\w-]+\.[\w-]+/); if (m) return m[0]; } return null; };
           return acha(localStorage) || acha(sessionStorage);
         }), 5000, null);
-        if (jwt) { cap.bearer = 'Bearer ' + jwt; cap.origem = 'armazenamento do navegador'; }
+        if (jwt) { cap.bearer = 'Bearer ' + jwt; cap.origem = 'armazenamento do navegador (jus.br)'; }
       }
-      if (!cap.bearer) throw new Error('não capturei o bearer do portal. ' + await diagnostico());
-      log('  bearer capturado em: ' + cap.origem);
+      if (!cap.bearer) throw new Error('não obtive o token do SSO. ' + await diagnostico());
+      log('  token obtido via: ' + cap.origem);
       return { cap, pagina, navegador, assinador };
     };
     const f = fluxo(); f.catch(() => {}); // o teto abaixo pode vencer antes; a rejeição de f fica tratada
@@ -261,16 +256,16 @@ async function processarEscritorio(c, esc) {
   const { cap, pagina, navegador, assinador } = sessao;
   try {
     const bearerOk = cap.bearer;
-    // Consulta de DENTRO da página (leva cookies e origem do portal); se não der, pelo Node.
+    // Consulta pelo Node com o token (a API não barra o servidor: sem token já respondia 401); se falhar, de dentro da página.
     const consultar = async (n) => {
       const url = `${API_PROCESSOS}?numeroProcesso=${n}`;
+      try { const r = await fetch(url, { headers: { Authorization: bearerOk, Accept: 'application/json' } }); return { status: r.status, texto: await r.text().catch(() => '') }; }
+      catch (e) { log('  fetch pelo Node falhou (' + e.message + '); tentando de dentro da página'); }
       const viaPagina = await comTempo(pagina.evaluate(async ([u, auth]) => {
         try { const r = await fetch(u, { headers: { Authorization: auth, Accept: 'application/json' } }); return { status: r.status, texto: await r.text() }; }
         catch (e) { return { status: 0, texto: String(e) }; }
       }, [url, bearerOk]), 30000, null);
-      if (viaPagina && viaPagina.status) return viaPagina;
-      const r = await fetch(url, { headers: { Authorization: bearerOk, Accept: 'application/json' } });
-      return { status: r.status, texto: await r.text().catch(() => '') };
+      return viaPagina || { status: 0, texto: 'sem resposta' };
     };
     const hoje = hojeBRT(); let totalHoje = 0, consultados = 0;
     for (const n of numeros.slice(0, LIMITE)) {

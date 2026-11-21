@@ -99,7 +99,7 @@ async function abrirAssinador(a1) {
 }
 
 // Faz o login por certificado + 2FA e devolve o bearer do PDPJ (ou lança erro).
-async function logar(a1, totpConf, certNav) {
+async function logar(a1, totpConf, certNav, numeros = []) {
   const assinador = await abrirAssinador(a1);
   const navegador = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   try {
@@ -108,15 +108,20 @@ async function logar(a1, totpConf, certNav) {
       clientCertificates: ORIGENS_CERT.map((origin) => ({ origin, pfxPath: certNav.pfxPath, passphrase: certNav.senha })),
     });
     const pagina = await contexto.newPage();
-    const cap = { bearer: null };
+    const cap = { bearer: null, origem: null, qualquer: null };
     const rede = []; // últimas requisições, para o diagnóstico
     const anota = (s) => { rede.push(s); if (rede.length > 30) rede.shift(); };
-    pagina.on('request', (r) => {
+    // No CONTEXTO (não só nesta página): pega o bearer mesmo se o portal abrir outra aba.
+    contexto.on('request', (r) => {
       const u = r.url(); const h = r.headers()['authorization'];
-      if (!cap.bearer && h && u.includes('/api/v2/')) cap.bearer = h;
+      let host = ''; try { host = new URL(u).hostname; } catch { /* url estranha */ }
+      if (h && /^bearer /i.test(h) && /\.jus\.br$/.test(host)) {
+        if (!cap.bearer && /\/api\//.test(u)) { cap.bearer = h; cap.origem = u.slice(0, 140); }
+        else if (!cap.qualquer) cap.qualquer = { h, u: u.slice(0, 140) };
+      }
       if (!/\.(png|jpe?g|gif|svg|woff2?|ttf|css|ico|map)(\?|$)/i.test(u)) anota(r.method() + ' ' + u.slice(0, 140));
     });
-    pagina.on('requestfailed', (r) => anota('FALHOU ' + r.url().slice(0, 140) + ' ' + ((r.failure() || {}).errorText || '')));
+    contexto.on('requestfailed', (r) => anota('FALHOU ' + r.url().slice(0, 140) + ' ' + ((r.failure() || {}).errorText || '')));
     pagina.on('popup', (p) => anota('POPUP ' + p.url().slice(0, 140)));
     pagina.on('dialog', (d) => { anota('DIALOG ' + d.message().slice(0, 100)); d.dismiss().catch(() => {}); });
     const diagnostico = async () => {
@@ -175,8 +180,56 @@ async function logar(a1, totpConf, certNav) {
       }
       if (new URL(pagina.url()).hostname === 'sso.cloud.pje.jus.br') throw new Error('não passou do login em 3 min. ' + await diagnostico());
       log('  passou do login → ' + pagina.url().slice(0, 120));
-      await pagina.goto(CONSULTA_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await pagina.waitForTimeout(4000);
+
+      // Portal de Serviços do PDPJ: entra com a sessão do SSO (mesmo realm) e pega o bearer que a tela usa na API.
+      const noPdpj = () => { try { return /pdpj\.jus\.br$/.test(new URL(pagina.url()).hostname); } catch { return false; } };
+      const esperarPortal = async () => {
+        for (let i = 0; i < 20 && !noPdpj(); i++) await pagina.waitForTimeout(1500); // ida e volta pelo SSO
+        await pagina.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      };
+      await pagina.goto(CONSULTA_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await esperarPortal();
+      log('  portal PDPJ: ' + await diagnostico());
+      // Se o portal mostrar um botão de entrar, clica (o SSO completa sozinho).
+      if (!cap.bearer) {
+        const entrar = (await acharVisivel(pagina.getByRole('button', { name: /^(entrar|acessar|login|fazer login)/i })))
+          || (await acharVisivel(pagina.getByRole('link', { name: /^(entrar|acessar|login)/i })));
+        if (entrar) {
+          log('  clicando em Entrar no portal…');
+          await entrar.click({ timeout: 5000, noWaitAfter: true }).catch(() => {});
+          await pagina.waitForTimeout(4000); await esperarPortal();
+          log('  portal PDPJ depois de Entrar: ' + await diagnostico());
+        }
+      }
+      // Dispara uma pesquisa para a tela chamar a API (é nessa chamada que vai o bearer).
+      if (!cap.bearer && numeros.length) {
+        const campos = pagina.locator('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"])');
+        const n = await campos.count().catch(() => 0); let campo = null;
+        for (let i = 0; i < n && !campo; i++) {
+          const el = campos.nth(i); if (!(await el.isVisible().catch(() => false))) continue;
+          const attrs = await comTempo(el.evaluate((e) => [e.placeholder, e.name, e.id, e.getAttribute('formcontrolname'), e.getAttribute('aria-label')].join(' ')), 3000, '');
+          if (/process|n[úu]mero|cnj|pesquis|busca|consult/i.test(attrs)) campo = el;
+        }
+        if (!campo) for (let i = 0; i < n && !campo; i++) { const el = campos.nth(i); if (await el.isVisible().catch(() => false)) campo = el; }
+        if (campo) {
+          log('  pesquisando o processo ' + numeros[0] + '…');
+          await campo.fill(numeros[0]).catch(() => {}); await campo.press('Enter').catch(() => {});
+          const btn = await acharVisivel(pagina.getByRole('button', { name: /pesquisar|buscar|consultar/i }));
+          if (btn) await btn.click({ timeout: 5000, noWaitAfter: true }).catch(() => {});
+        } else log('  nenhum campo de pesquisa visível no portal');
+        for (let i = 0; i < 40 && !cap.bearer; i++) await pagina.waitForTimeout(1000);
+      }
+      // Alternativas: um bearer de outra chamada *.jus.br, ou o token que o app guarda no navegador (JWT começa com "eyJ").
+      if (!cap.bearer && cap.qualquer) { cap.bearer = cap.qualquer.h; cap.origem = cap.qualquer.u + ' (não era /api/)'; }
+      if (!cap.bearer) {
+        const jwt = await comTempo(pagina.evaluate(() => {
+          const acha = (s) => { for (let i = 0; i < s.length; i++) { const v = s.getItem(s.key(i)) || ''; const m = v.match(/eyJ[\w-]+\.eyJ[\w-]+\.[\w-]+/); if (m) return m[0]; } return null; };
+          return acha(localStorage) || acha(sessionStorage);
+        }), 5000, null);
+        if (jwt) { cap.bearer = 'Bearer ' + jwt; cap.origem = 'armazenamento do navegador'; }
+      }
+      if (!cap.bearer) throw new Error('não capturei o bearer do portal. ' + await diagnostico());
+      log('  bearer capturado em: ' + cap.origem);
       return { cap, pagina, navegador, assinador };
     };
     const f = fluxo(); f.catch(() => {}); // o teto abaixo pode vencer antes; a rejeição de f fica tratada
@@ -201,25 +254,32 @@ async function processarEscritorio(c, esc) {
   const cn = (a1.folha.subject.split('\n').find((l) => l.startsWith('CN=')) || 'CN=').slice(3);
   const cpf = (cn.match(/(\d{11})\s*$/) || [])[1] || null;
 
+  const numeros = await numerosDoEscritorio(c, esc);
+  log(`  ${numeros.length} processo(s) do escritório para consultar`);
   let sessao;
-  try { sessao = await logar(a1, totpConf, { pfxPath: pfxTmp, senha: cert.senha }); } catch (e) { fs.rmSync(pfxTmp, { force: true }); await marcarErro(e.message); throw e; }
+  try { sessao = await logar(a1, totpConf, { pfxPath: pfxTmp, senha: cert.senha }, numeros); } catch (e) { fs.rmSync(pfxTmp, { force: true }); await marcarErro(e.message); throw e; }
   const { cap, pagina, navegador, assinador } = sessao;
   try {
-    const numeros = await numerosDoEscritorio(c, esc);
-    if (!cap.bearer && numeros.length) {
-      const campo = await pagina.$('input[formcontrolname*="numero" i], input[placeholder*="processo" i], input[type="text"]');
-      if (campo) { await campo.fill(numeros[0]); await campo.press('Enter'); }
-      for (let i = 0; i < 40 && !cap.bearer; i++) await pagina.waitForTimeout(1000);
-    }
     const bearerOk = cap.bearer;
-    if (!bearerOk) throw new Error('não capturei o bearer do portal');
-
+    // Consulta de DENTRO da página (leva cookies e origem do portal); se não der, pelo Node.
+    const consultar = async (n) => {
+      const url = `${API_PROCESSOS}?numeroProcesso=${n}`;
+      const viaPagina = await comTempo(pagina.evaluate(async ([u, auth]) => {
+        try { const r = await fetch(u, { headers: { Authorization: auth, Accept: 'application/json' } }); return { status: r.status, texto: await r.text() }; }
+        catch (e) { return { status: 0, texto: String(e) }; }
+      }, [url, bearerOk]), 30000, null);
+      if (viaPagina && viaPagina.status) return viaPagina;
+      const r = await fetch(url, { headers: { Authorization: bearerOk, Accept: 'application/json' } });
+      return { status: r.status, texto: await r.text().catch(() => '') };
+    };
     const hoje = hojeBRT(); let totalHoje = 0, consultados = 0;
     for (const n of numeros.slice(0, LIMITE)) {
-      const r = await fetch(`${API_PROCESSOS}?numeroProcesso=${n}`, { headers: { Authorization: bearerOk, Accept: 'application/json' } });
-      if (!r.ok) { log(`  ${esc} ${n}: HTTP ${r.status}`); continue; }
+      const r = await consultar(n);
+      if (r.status < 200 || r.status >= 300) { log(`  ${n}: HTTP ${r.status} ${String(r.texto).replace(/\s+/g, ' ').slice(0, 120)}`); continue; }
       consultados++;
-      const movs = extrairMovimentos(await r.json().catch(() => ({})));
+      let json = {}; try { json = JSON.parse(r.texto); } catch { /* não era JSON */ }
+      if (consultados === 1) log('  exemplo de resposta: ' + String(r.texto).replace(/\s+/g, ' ').slice(0, 300));
+      const movs = extrairMovimentos(json);
       totalHoje += movs.filter((m) => dataBRT(m.data) === hoje).length;
       await new Promise((ok) => setTimeout(ok, 800));
     }

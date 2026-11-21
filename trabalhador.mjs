@@ -231,7 +231,7 @@ async function logar(a1, totpConf, certNav, numeros = []) {
       }
       if (!cap.bearer) throw new Error('não obtive o token do SSO. ' + await diagnostico());
       log('  token obtido via: ' + cap.origem);
-      return { cap, pagina, navegador, assinador };
+      return { cap, pagina, navegador, assinador, contexto };
     };
     const f = fluxo(); f.catch(() => {}); // o teto abaixo pode vencer antes; a rejeição de f fica tratada
     let teto;
@@ -259,19 +259,30 @@ async function processarEscritorio(c, esc) {
   log(`  ${numeros.length} processo(s) do escritório para consultar`);
   let sessao;
   try { sessao = await logar(a1, totpConf, { pfxPath: pfxTmp, senha: cert.senha }, numeros); } catch (e) { fs.rmSync(pfxTmp, { force: true }); await marcarErro(e.message); throw e; }
-  const { cap, pagina, navegador, assinador } = sessao;
+  const { cap, pagina, navegador, assinador, contexto } = sessao;
   try {
     const bearerOk = cap.bearer;
-    // Consulta pelo Node com o token (a API não barra o servidor: sem token já respondia 401); se falhar, de dentro da página.
+    let diagnosticado = false;
+    // Primeiro pelo contexto autenticado do navegador (leva os cookies/origem reais da sessão); se falhar, pelo Node.
+    // No 1º insucesso, registra status + cabeçalhos da resposta — é isso que diz se é a API recusando o token ou a borda.
     const consultar = async (n) => {
       const url = `${API_PROCESSOS}?numeroProcesso=${n}`;
-      try { const r = await fetch(url, { headers: { Authorization: bearerOk, Accept: 'application/json' } }); return { status: r.status, texto: await r.text().catch(() => '') }; }
-      catch (e) { log('  fetch pelo Node falhou (' + e.message + '); tentando de dentro da página'); }
-      const viaPagina = await comTempo(pagina.evaluate(async ([u, auth]) => {
-        try { const r = await fetch(u, { headers: { Authorization: auth, Accept: 'application/json' } }); return { status: r.status, texto: await r.text() }; }
-        catch (e) { return { status: 0, texto: String(e) }; }
-      }, [url, bearerOk]), 30000, null);
-      return viaPagina || { status: 0, texto: 'sem resposta' };
+      let via = 'contexto', status = 0, texto = '', cabecalhos = {};
+      try {
+        const r = await contexto.request.get(url, { headers: { Authorization: bearerOk, Accept: 'application/json' }, timeout: 30000, failOnStatusCode: false });
+        status = r.status(); texto = await r.text().catch(() => ''); cabecalhos = r.headers();
+      } catch (e) { log('  consulta pelo contexto falhou (' + e.message + '); tentando pelo Node'); }
+      if (status < 200 || status >= 300) {
+        try { via = 'node'; const r = await fetch(url, { headers: { Authorization: bearerOk, Accept: 'application/json' } }); status = r.status; texto = await r.text().catch(() => ''); cabecalhos = Object.fromEntries(r.headers.entries()); }
+        catch (e) { log('  fetch pelo Node falhou: ' + e.message); }
+      }
+      if ((status < 200 || status >= 300) && !diagnosticado) {
+        diagnosticado = true;
+        const quero = ['server', 'content-type', 'www-authenticate', 'x-kong-upstream-status', 'x-request-id', 'cf-ray', 'via', 'x-cache', 'retry-after'];
+        const cab = quero.filter((k) => cabecalhos[k]).map((k) => `${k}=${cabecalhos[k]}`).join(' ');
+        log(`  [diagnóstico ${via}] HTTP ${status} · cabeçalhos: ${cab || '(nenhum relevante)'} · corpo: ${String(texto).replace(/\s+/g, ' ').slice(0, 200)}`);
+      }
+      return { status, texto };
     };
     const hoje = hojeBRT(); let totalHoje = 0, consultados = 0;
     for (const n of numeros.slice(0, LIMITE)) {

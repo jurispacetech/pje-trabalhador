@@ -78,9 +78,22 @@ const ORIGENS_CERT = ['https://sso.cloud.pje.jus.br', 'https://www.jus.br', 'htt
 const comTempo = (p, ms, padrao) => Promise.race([Promise.resolve(p).catch(() => padrao), new Promise((ok) => setTimeout(() => ok(padrao), ms))]);
 const TETO_LOGIN_MS = 240000;
 
+// Abre o assinador na 8800. A página do PJe só fala nessa porta, então duas rodadas não podem coexistir:
+// se outra ainda estiver com a porta (rodada do boot + teste à mão, por exemplo), espera ela terminar (até 5 min).
+async function abrirAssinador(a1) {
+  const ate = Date.now() + 300000; let avisou = false;
+  for (;;) {
+    try { return await iniciarAssinador({ a1, log }); } catch (e) {
+      if (e.code !== 'EADDRINUSE' || Date.now() > ate) throw e;
+      if (!avisou) { avisou = true; log('  porta 8800 ocupada por outra rodada — aguardando ela terminar…'); }
+      await new Promise((ok) => setTimeout(ok, 5000));
+    }
+  }
+}
+
 // Faz o login por certificado + 2FA e devolve o bearer do PDPJ (ou lança erro).
 async function logar(a1, totpConf, certNav) {
-  const assinador = await iniciarAssinador({ a1, log });
+  const assinador = await abrirAssinador(a1);
   const navegador = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   try {
     const contexto = await navegador.newContext({
@@ -213,13 +226,16 @@ async function processarEscritorio(c, esc) {
   }
 }
 
+let rodadaEmCurso = false; // duas rodadas no mesmo processo nunca se atropelam
 async function rodada() {
-  const c = conectar(); await c.connect(); await c.query("set statement_timeout='30s'");
+  if (rodadaEmCurso) { log('rodada pulada: a anterior ainda está em curso'); return; }
+  rodadaEmCurso = true;
+  const c = conectar(); await c.connect().catch((e) => { rodadaEmCurso = false; throw e; }); await c.query("set statement_timeout='30s'");
   try {
     const escs = await escritoriosParaRodar(c);
     log(`rodada: ${escs.length} escritório(s) com certificado`);
     for (const esc of escs) { try { await processarEscritorio(c, esc); } catch (e) { log(`escritório ${esc}: FALHOU — ${e.message}`); } }
-  } finally { await c.end().catch(() => {}); }
+  } finally { await c.end().catch(() => {}); rodadaEmCurso = false; }
 }
 
 log('trabalhador do PJe iniciado · horários 07/14/18/21h (America/Sao_Paulo)');

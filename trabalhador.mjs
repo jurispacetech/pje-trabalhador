@@ -80,17 +80,32 @@ async function logar(a1, totpConf) {
   pagina.on('request', (r) => { const h = r.headers()['authorization']; if (!cap.bearer && h && r.url().includes('/api/v2/')) cap.bearer = h; });
   try {
     await pagina.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    // O botão "Seu certificado digital" chama autenticar(...) tanto na tela antiga (#kc-pje-office)
-    // quanto na nova (Portal Jus.br): casa pelo onclick, que é o que dispara o assinador.
-    const SELETOR_CERT = '[onclick^="autenticar("], #kc-pje-office';
-    try {
-      await pagina.waitForSelector(SELETOR_CERT, { timeout: 30000 });
-    } catch {
+    // Portal Jus.br (tema novo): o botão se chama "Entrar com seu certificado digital" e pode ficar
+    // atrás de "Outras opções de acesso". Na tela antiga era #kc-pje-office / onclick="autenticar(".
+    await pagina.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+    const outras = pagina.getByText(/outras op[cç][oõ]es de acesso/i);
+    if (await outras.count().catch(() => 0)) { await outras.first().click({ timeout: 5000 }).catch(() => {}); await pagina.waitForTimeout(1200); }
+    const candidatos = [
+      pagina.getByRole('button', { name: /certificado digital/i }),
+      pagina.getByRole('link', { name: /certificado digital/i }),
+      pagina.getByText(/certificado digital/i),
+      pagina.locator('[onclick^="autenticar("], #kc-pje-office'),
+    ];
+    let botao = null;
+    for (let i = 0; i < 20 && !botao; i++) {
+      for (const c of candidatos) if (!botao && (await c.count().catch(() => 0))) botao = c.first();
+      if (!botao) await pagina.waitForTimeout(1500);
+    }
+    const diagnostico = async () => {
       const url = pagina.url(); const titulo = await pagina.title().catch(() => '');
       const txt = await pagina.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
-      throw new Error(`login não carregou o botão. URL=${url} título="${titulo}" texto="${String(txt).replace(/\s+/g, ' ').slice(0, 500)}"`);
-    }
-    await pagina.click(SELETOR_CERT);
+      return `URL=${url} título="${titulo}" texto="${String(txt).replace(/\s+/g, ' ').slice(0, 500)}"`;
+    };
+    if (!botao) throw new Error('login não carregou o botão. ' + await diagnostico());
+    log('  botão do certificado encontrado, clicando…');
+    await botao.click({ timeout: 10000 });
+    await pagina.waitForTimeout(3000);
+    log('  após o clique: ' + await diagnostico());
     const inicio = Date.now(); let totpFeito = false;
     while (Date.now() - inicio < 180000) {
       await pagina.waitForTimeout(1500);
@@ -105,7 +120,7 @@ async function logar(a1, totpConf) {
         totpFeito = true;
       }
     }
-    if (new URL(pagina.url()).hostname === 'sso.cloud.pje.jus.br') throw new Error('não passou do login em 3 min');
+    if (new URL(pagina.url()).hostname === 'sso.cloud.pje.jus.br') throw new Error('não passou do login em 3 min. ' + await diagnostico());
     await pagina.goto(CONSULTA_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await pagina.waitForTimeout(4000);
     return { cap, pagina, navegador, assinador };

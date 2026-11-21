@@ -71,63 +71,96 @@ function extrairMovimentos(obj, achados = []) {
   return achados;
 }
 
+// Origens em que o navegador apresenta o A1 se o servidor pedir certificado (mTLS) — o Portal Jus.br
+// pode autenticar pelo navegador em vez do PJe Office; assim os dois caminhos ficam cobertos.
+const ORIGENS_CERT = ['https://sso.cloud.pje.jus.br', 'https://www.jus.br', 'https://portaldeservicos.pdpj.jus.br'];
+// Promessa com prazo: nenhuma leitura da página pode segurar a rodada para sempre.
+const comTempo = (p, ms, padrao) => Promise.race([Promise.resolve(p).catch(() => padrao), new Promise((ok) => setTimeout(() => ok(padrao), ms))]);
+const TETO_LOGIN_MS = 240000;
+
 // Faz o login por certificado + 2FA e devolve o bearer do PDPJ (ou lança erro).
-async function logar(a1, totpConf) {
+async function logar(a1, totpConf, certNav) {
   const assinador = await iniciarAssinador({ a1, log });
   const navegador = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
-  const pagina = await (await navegador.newContext({ locale: 'pt-BR' })).newPage();
-  const cap = { bearer: null };
-  pagina.on('request', (r) => { const h = r.headers()['authorization']; if (!cap.bearer && h && r.url().includes('/api/v2/')) cap.bearer = h; });
   try {
-    await pagina.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    // Portal Jus.br (tema novo): o botão se chama "Entrar com seu certificado digital" e pode ficar
-    // atrás de "Outras opções de acesso". Na tela antiga era #kc-pje-office / onclick="autenticar(".
-    await pagina.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-    const candidatos = [
-      pagina.getByRole('button', { name: /certificado digital/i }),
-      pagina.getByRole('link', { name: /certificado digital/i }),
-      pagina.getByText(/certificado digital/i),
-      pagina.locator('[onclick^="autenticar("], #kc-pje-office'),
-    ];
-    const acharVisivel = async (loc) => { const n = await loc.count().catch(() => 0); for (let i = 0; i < n; i++) { const el = loc.nth(i); if (await el.isVisible().catch(() => false)) return el; } return null; };
-    const primeiroExistente = async () => { for (const c of candidatos) if (await c.count().catch(() => 0)) return c.first(); return null; };
-    const primeiroVisivel = async () => { for (const c of candidatos) { const v = await acharVisivel(c); if (v) return v; } return null; };
+    const contexto = await navegador.newContext({
+      locale: 'pt-BR',
+      clientCertificates: ORIGENS_CERT.map((origin) => ({ origin, pfxPath: certNav.pfxPath, passphrase: certNav.senha })),
+    });
+    const pagina = await contexto.newPage();
+    const cap = { bearer: null };
+    const rede = []; // últimas requisições, para o diagnóstico
+    const anota = (s) => { rede.push(s); if (rede.length > 30) rede.shift(); };
+    pagina.on('request', (r) => {
+      const u = r.url(); const h = r.headers()['authorization'];
+      if (!cap.bearer && h && u.includes('/api/v2/')) cap.bearer = h;
+      if (!/\.(png|jpe?g|gif|svg|woff2?|ttf|css|ico|map)(\?|$)/i.test(u)) anota(r.method() + ' ' + u.slice(0, 140));
+    });
+    pagina.on('requestfailed', (r) => anota('FALHOU ' + r.url().slice(0, 140) + ' ' + ((r.failure() || {}).errorText || '')));
+    pagina.on('popup', (p) => anota('POPUP ' + p.url().slice(0, 140)));
+    pagina.on('dialog', (d) => { anota('DIALOG ' + d.message().slice(0, 100)); d.dismiss().catch(() => {}); });
     const diagnostico = async () => {
-      const url = pagina.url(); const titulo = await pagina.title().catch(() => '');
-      const txt = await pagina.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
-      return `URL=${url} título="${titulo}" texto="${String(txt).replace(/\s+/g, ' ').slice(0, 500)}"`;
+      const url = pagina.url();
+      const titulo = await comTempo(pagina.title(), 5000, '');
+      const txt = await comTempo(pagina.evaluate(() => (document.body ? document.body.innerText : '')), 5000, '');
+      return `URL=${url} título="${titulo}" texto="${String(txt).replace(/\s+/g, ' ').slice(0, 400)}" rede=[${rede.slice(-12).join(' | ')}]`;
     };
-    // Espera a tela montar (algum candidato existir, mesmo escondido).
-    for (let i = 0; i < 20 && !(await primeiroExistente()); i++) await pagina.waitForTimeout(1000);
-    // O botão costuma ficar recolhido em "Outras opções de acesso". Estratégias, em ordem:
-    // já visível → abre "Outras opções" com clique → abre por JS → clica o próprio botão por JS (funciona oculto).
-    const outras = pagina.getByText(/outras op[cç][oõ]es de acesso/i);
-    let botao = await primeiroVisivel(); let clicadoPorJs = false;
-    if (!botao) { const o = await acharVisivel(outras); if (o) { log('  abrindo "Outras opções de acesso"…'); await o.click({ timeout: 4000 }).catch(() => {}); await pagina.waitForTimeout(1500); botao = await primeiroVisivel(); } }
-    if (!botao && (await outras.count().catch(() => 0))) { log('  abrindo "Outras opções de acesso" por JS…'); await outras.first().evaluate((el) => el.click()).catch(() => {}); await pagina.waitForTimeout(1500); botao = await primeiroVisivel(); }
-    if (!botao) { const e = await primeiroExistente(); if (e) { log('  botão do certificado existe mas está escondido; clicando por JS…'); await e.evaluate((el) => el.click()).catch(() => {}); clicadoPorJs = true; botao = e; } }
-    if (!botao) throw new Error('login não carregou o botão. ' + await diagnostico());
-    if (!clicadoPorJs) { log('  botão do certificado encontrado, clicando…'); await botao.click({ timeout: 10000 }); }
-    await pagina.waitForTimeout(3000);
-    log('  após o clique: ' + await diagnostico());
-    const inicio = Date.now(); let totpFeito = false;
-    while (Date.now() - inicio < 180000) {
-      await pagina.waitForTimeout(1500);
-      if (new URL(pagina.url()).hostname !== 'sso.cloud.pje.jus.br') break;
-      const otp = await pagina.$('input[name="otp"], input#otp, input[name="totp"], input[autocomplete="one-time-code"]');
-      if (otp && !totpFeito) {
-        if (!totpConf) throw new Error('o PJe pediu 2FA mas não há autenticador PDPJ cadastrado');
-        if (segundosRestantes(Date.now(), totpConf.periodo) < 5) await pagina.waitForTimeout(6000);
-        await otp.fill(codigoTotp(totpConf.segredo, Date.now(), { passo: totpConf.periodo, digitos: totpConf.digitos }));
-        const btn = await pagina.$('#kc-login, button[type="submit"], input[type="submit"]');
-        if (btn) await btn.click(); else await otp.press('Enter');
-        totpFeito = true;
+
+    const fluxo = async () => {
+      await pagina.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      // Portal Jus.br (tema novo): o botão se chama "Entrar com seu certificado digital" e pode ficar
+      // atrás de "Outras opções de acesso". Na tela antiga era #kc-pje-office / onclick="autenticar(".
+      await pagina.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+      const candidatos = [
+        pagina.getByRole('button', { name: /certificado digital/i }),
+        pagina.getByRole('link', { name: /certificado digital/i }),
+        pagina.getByText(/certificado digital/i),
+        pagina.locator('[onclick^="autenticar("], #kc-pje-office'),
+      ];
+      const acharVisivel = async (loc) => { const n = await loc.count().catch(() => 0); for (let i = 0; i < n; i++) { const el = loc.nth(i); if (await el.isVisible().catch(() => false)) return el; } return null; };
+      const primeiroExistente = async () => { for (const c of candidatos) if (await c.count().catch(() => 0)) return c.first(); return null; };
+      const primeiroVisivel = async () => { for (const c of candidatos) { const v = await acharVisivel(c); if (v) return v; } return null; };
+      // Espera a tela montar (algum candidato existir, mesmo escondido).
+      for (let i = 0; i < 20 && !(await primeiroExistente()); i++) await pagina.waitForTimeout(1000);
+      // Estratégias, em ordem: já visível → abre "Outras opções" com clique → abre por JS → clica o próprio botão por JS.
+      const outras = pagina.getByText(/outras op[cç][oõ]es de acesso/i);
+      let botao = await primeiroVisivel(); let clicadoPorJs = false;
+      if (!botao) { const o = await acharVisivel(outras); if (o) { log('  abrindo "Outras opções de acesso"…'); await o.click({ timeout: 4000 }).catch(() => {}); await pagina.waitForTimeout(1500); botao = await primeiroVisivel(); } }
+      if (!botao && (await outras.count().catch(() => 0))) { log('  abrindo "Outras opções de acesso" por JS…'); await outras.first().evaluate((el) => el.click()).catch(() => {}); await pagina.waitForTimeout(1500); botao = await primeiroVisivel(); }
+      if (!botao) { const e = await primeiroExistente(); if (e) { log('  botão do certificado existe mas está escondido; clicando por JS…'); await e.evaluate((el) => el.click()).catch(() => {}); clicadoPorJs = true; botao = e; } }
+      if (!botao) throw new Error('login não carregou o botão. ' + await diagnostico());
+      if (!clicadoPorJs) {
+        log('  botão do certificado encontrado, clicando…');
+        // noWaitAfter: não fica preso esperando a navegação que o clique dispara — o diagnóstico abaixo mostra o que houve.
+        await botao.click({ timeout: 10000, noWaitAfter: true });
       }
-    }
-    if (new URL(pagina.url()).hostname === 'sso.cloud.pje.jus.br') throw new Error('não passou do login em 3 min. ' + await diagnostico());
-    await pagina.goto(CONSULTA_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await pagina.waitForTimeout(4000);
-    return { cap, pagina, navegador, assinador };
+      log('  clique feito · URL agora: ' + pagina.url());
+      await pagina.waitForTimeout(3000);
+      log('  após o clique: ' + await diagnostico());
+
+      const inicio = Date.now(); let totpFeito = false; let ultimoAviso = 0;
+      while (Date.now() - inicio < 180000) {
+        await pagina.waitForTimeout(1500);
+        if (new URL(pagina.url()).hostname !== 'sso.cloud.pje.jus.br') break;
+        if (Date.now() - ultimoAviso > 30000) { ultimoAviso = Date.now(); log('  aguardando o login… ' + await diagnostico()); }
+        const otp = await comTempo(pagina.$('input[name="otp"], input#otp, input[name="totp"], input[autocomplete="one-time-code"]'), 5000, null);
+        if (otp && !totpFeito) {
+          if (!totpConf) throw new Error('o PJe pediu 2FA mas não há autenticador PDPJ cadastrado');
+          if (segundosRestantes(Date.now(), totpConf.periodo) < 5) await pagina.waitForTimeout(6000);
+          await otp.fill(codigoTotp(totpConf.segredo, Date.now(), { passo: totpConf.periodo, digitos: totpConf.digitos }));
+          const btn = await pagina.$('#kc-login, button[type="submit"], input[type="submit"]');
+          if (btn) await btn.click({ noWaitAfter: true }); else await otp.press('Enter');
+          totpFeito = true; log('  código 2FA preenchido');
+        }
+      }
+      if (new URL(pagina.url()).hostname === 'sso.cloud.pje.jus.br') throw new Error('não passou do login em 3 min. ' + await diagnostico());
+      log('  passou do login → ' + pagina.url().slice(0, 120));
+      await pagina.goto(CONSULTA_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await pagina.waitForTimeout(4000);
+      return { cap, pagina, navegador, assinador };
+    };
+    const f = fluxo(); f.catch(() => {}); // o teto abaixo pode vencer antes; a rejeição de f fica tratada
+    return await Promise.race([f, new Promise((_, rej) => setTimeout(() => rej(new Error('login travou (passou de 4 min)')), TETO_LOGIN_MS))]);
   } catch (e) {
     await navegador.close().catch(() => {});
     assinador.close();
@@ -141,13 +174,13 @@ async function processarEscritorio(c, esc) {
   const cert = await lerCertificado(c, esc);
   const pfxTmp = path.join(os.tmpdir(), 'pje-' + esc + '-' + Date.now() + '.pfx');
   fs.writeFileSync(pfxTmp, Buffer.from(cert.pfxBase64, 'base64'), { mode: 0o600 });
-  try { a1 = carregarA1(pfxTmp, cert.senha); } catch (e) { await marcarErro('senha do certificado não abre o .pfx'); throw e; } finally { fs.rmSync(pfxTmp, { force: true }); }
+  try { a1 = carregarA1(pfxTmp, cert.senha); } catch (e) { fs.rmSync(pfxTmp, { force: true }); await marcarErro('senha do certificado não abre o .pfx'); throw e; } // o .pfx fica até o fim: o navegador também o usa (mTLS)
   totpConf = await lerTotp(c, esc);
   const cn = (a1.folha.subject.split('\n').find((l) => l.startsWith('CN=')) || 'CN=').slice(3);
   const cpf = (cn.match(/(\d{11})\s*$/) || [])[1] || null;
 
   let sessao;
-  try { sessao = await logar(a1, totpConf); } catch (e) { await marcarErro(e.message); throw e; }
+  try { sessao = await logar(a1, totpConf, { pfxPath: pfxTmp, senha: cert.senha }); } catch (e) { fs.rmSync(pfxTmp, { force: true }); await marcarErro(e.message); throw e; }
   const { cap, pagina, navegador, assinador } = sessao;
   try {
     const numeros = await numerosDoEscritorio(c, esc);
@@ -176,6 +209,7 @@ async function processarEscritorio(c, esc) {
   } finally {
     await navegador.close().catch(() => {});
     assinador.close();
+    fs.rmSync(pfxTmp, { force: true });
   }
 }
 

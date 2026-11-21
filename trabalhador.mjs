@@ -24,7 +24,14 @@ const API_PROCESSOS = 'https://portaldeservicos.pdpj.jus.br/api/v2/processos';
 const LIMITE = Number(process.env.PJE_LIMITE || 8);
 const PADRAO_PJE = /pdpj|pj-?e|jus\.?br/i;
 
-const log = (...a) => console.log(new Date().toISOString(), ...a);
+// Log no console E num arquivo (ler no EasyPanel: Console → tail -n 80 /tmp/movimentacoes-julia.log).
+const ARQ_LOG = process.env.PJE_LOG || '/tmp/movimentacoes-julia.log';
+try { if (fs.statSync(ARQ_LOG).size > 5e6) fs.renameSync(ARQ_LOG, ARQ_LOG + '.old'); } catch { /* ainda não existe */ }
+const log = (...a) => {
+  const linha = new Date().toISOString() + ' ' + a.map((x) => (typeof x === 'string' ? x : String(x))).join(' ');
+  console.log(linha);
+  try { fs.appendFileSync(ARQ_LOG, linha + '\n'); } catch { /* sem disco: segue só no console */ }
+};
 const hojeBRT = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
 const dataBRT = (v) => { const d = new Date(v); return isNaN(d) ? null : d.toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' }); };
 
@@ -173,7 +180,9 @@ async function logar(a1, totpConf, certNav) {
       return { cap, pagina, navegador, assinador };
     };
     const f = fluxo(); f.catch(() => {}); // o teto abaixo pode vencer antes; a rejeição de f fica tratada
-    return await Promise.race([f, new Promise((_, rej) => setTimeout(() => rej(new Error('login travou (passou de 4 min)')), TETO_LOGIN_MS))]);
+    let teto;
+    try { return await Promise.race([f, new Promise((_, rej) => { teto = setTimeout(() => rej(new Error('login travou (passou de 4 min)')), TETO_LOGIN_MS); })]); }
+    finally { clearTimeout(teto); }
   } catch (e) {
     await navegador.close().catch(() => {});
     assinador.close();

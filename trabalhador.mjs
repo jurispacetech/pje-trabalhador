@@ -83,27 +83,31 @@ async function logar(a1, totpConf) {
     // Portal Jus.br (tema novo): o botão se chama "Entrar com seu certificado digital" e pode ficar
     // atrás de "Outras opções de acesso". Na tela antiga era #kc-pje-office / onclick="autenticar(".
     await pagina.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-    const outras = pagina.getByText(/outras op[cç][oõ]es de acesso/i);
-    if (await outras.count().catch(() => 0)) { await outras.first().click({ timeout: 5000 }).catch(() => {}); await pagina.waitForTimeout(1200); }
     const candidatos = [
       pagina.getByRole('button', { name: /certificado digital/i }),
       pagina.getByRole('link', { name: /certificado digital/i }),
       pagina.getByText(/certificado digital/i),
       pagina.locator('[onclick^="autenticar("], #kc-pje-office'),
     ];
-    let botao = null;
-    for (let i = 0; i < 20 && !botao; i++) {
-      for (const c of candidatos) if (!botao && (await c.count().catch(() => 0))) botao = c.first();
-      if (!botao) await pagina.waitForTimeout(1500);
-    }
+    const acharVisivel = async (loc) => { const n = await loc.count().catch(() => 0); for (let i = 0; i < n; i++) { const el = loc.nth(i); if (await el.isVisible().catch(() => false)) return el; } return null; };
+    const primeiroExistente = async () => { for (const c of candidatos) if (await c.count().catch(() => 0)) return c.first(); return null; };
+    const primeiroVisivel = async () => { for (const c of candidatos) { const v = await acharVisivel(c); if (v) return v; } return null; };
     const diagnostico = async () => {
       const url = pagina.url(); const titulo = await pagina.title().catch(() => '');
       const txt = await pagina.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
       return `URL=${url} título="${titulo}" texto="${String(txt).replace(/\s+/g, ' ').slice(0, 500)}"`;
     };
+    // Espera a tela montar (algum candidato existir, mesmo escondido).
+    for (let i = 0; i < 20 && !(await primeiroExistente()); i++) await pagina.waitForTimeout(1000);
+    // O botão costuma ficar recolhido em "Outras opções de acesso". Estratégias, em ordem:
+    // já visível → abre "Outras opções" com clique → abre por JS → clica o próprio botão por JS (funciona oculto).
+    const outras = pagina.getByText(/outras op[cç][oõ]es de acesso/i);
+    let botao = await primeiroVisivel(); let clicadoPorJs = false;
+    if (!botao) { const o = await acharVisivel(outras); if (o) { log('  abrindo "Outras opções de acesso"…'); await o.click({ timeout: 4000 }).catch(() => {}); await pagina.waitForTimeout(1500); botao = await primeiroVisivel(); } }
+    if (!botao && (await outras.count().catch(() => 0))) { log('  abrindo "Outras opções de acesso" por JS…'); await outras.first().evaluate((el) => el.click()).catch(() => {}); await pagina.waitForTimeout(1500); botao = await primeiroVisivel(); }
+    if (!botao) { const e = await primeiroExistente(); if (e) { log('  botão do certificado existe mas está escondido; clicando por JS…'); await e.evaluate((el) => el.click()).catch(() => {}); clicadoPorJs = true; botao = e; } }
     if (!botao) throw new Error('login não carregou o botão. ' + await diagnostico());
-    log('  botão do certificado encontrado, clicando…');
-    await botao.click({ timeout: 10000 });
+    if (!clicadoPorJs) { log('  botão do certificado encontrado, clicando…'); await botao.click({ timeout: 10000 }); }
     await pagina.waitForTimeout(3000);
     log('  após o clique: ' + await diagnostico());
     const inicio = Date.now(); let totpFeito = false;

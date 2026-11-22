@@ -55,27 +55,27 @@ async function paresParaRodar(c, esc) {
       const alvo = sigla(t.contaDoAutenticador || t.sigla || t.id);                       // eProc → autenticador do próprio tribunal (TJSP, JFRS→TRF4…)
       if (alvo) aut = auts.find(a => sigla(a.nome) === alvo);
     }
-    if (aut && mapa[aut.id]) pares.push({ tribunal: t.id, sigla: t.sigla || t.id, seed: mapa[aut.id], autNome: aut.nome });
+    if (aut && mapa[aut.id]) pares.push({ tribunal: t.id, sigla: t.sigla || t.id, seed: mapa[aut.id], autNome: aut.nome, abre: !!(t.recursos && t.recursos.abrirIntimacao) });
   }
   return pares;
 }
 
 const UPSERT = `insert into intimacoes
-  (escritorio_id, chave, numero_processo, tribunal, orgao, classe, tipo, disponibilizada_em, partes, contas_ids, fonte, prazo, fim_do_prazo, limite_ciencia, ciencia_pendente, id_processo_tribunal)
-  values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'{}','julia',$10,$11,$12,$13,$14)
+  (escritorio_id, chave, numero_processo, tribunal, orgao, classe, tipo, disponibilizada_em, partes, contas_ids, fonte, prazo, fim_do_prazo, limite_ciencia, ciencia_pendente, id_processo_tribunal, abre_ciencia)
+  values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'{}','julia',$10,$11,$12,$13,$14,$15)
   on conflict (escritorio_id, chave) do update set
     numero_processo=excluded.numero_processo, tribunal=excluded.tribunal, orgao=excluded.orgao, classe=excluded.classe,
     tipo=excluded.tipo, disponibilizada_em=excluded.disponibilizada_em, partes=excluded.partes,
     prazo=excluded.prazo, fim_do_prazo=excluded.fim_do_prazo, limite_ciencia=excluded.limite_ciencia,
-    ciencia_pendente=excluded.ciencia_pendente, id_processo_tribunal=excluded.id_processo_tribunal`;
+    ciencia_pendente=excluded.ciencia_pendente, id_processo_tribunal=excluded.id_processo_tribunal, abre_ciencia=excluded.abre_ciencia`;
 
-async function gravar(c, esc, sigla, it) {
+async function gravar(c, esc, sigla, it, abre) {
   const chave = it.idExpediente || (soDigitos(it.cnj) + '-' + (it.criadoEm || ''));
   const disp = soData(it.criadoEm) || new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
   await c.query(UPSERT, [
     esc, chave, soDigitos(it.cnj), sigla, it.orgao || null, it.classe || null, it.tipo || null,
     disp, JSON.stringify(parsePartes(it.partes)), it.prazo || null, ts(it.fimDoPrazo), ts(it.limiteCiencia),
-    typeof it.cienciaPendente === 'boolean' ? it.cienciaPendente : null, it.idProcessoTribunal || null,
+    typeof it.cienciaPendente === 'boolean' ? it.cienciaPendente : null, it.idProcessoTribunal || null, !!abre,
   ]);
 }
 
@@ -87,7 +87,7 @@ async function umTribunal(c, esc, cert, t) {
   try {
     const r = await intimacoes(sess.sessao);
     let n = 0;
-    for (const it of (r.intimacoes || [])) { try { await gravar(c, esc, t.sigla, it); n++; } catch (e) { log(`    erro ao gravar ${it.idExpediente}: ${e.message}`); } }
+    for (const it of (r.intimacoes || [])) { try { await gravar(c, esc, t.sigla, it, t.abre); n++; } catch (e) { log(`    erro ao gravar ${it.idExpediente}: ${e.message}`); } }
     log(`  ${t.sigla}: ${r.total} intimação(ões) pendente(s) · ${n} gravada(s) com fonte=julia`);
   } finally { await encerrar(sess.sessao); }
 }

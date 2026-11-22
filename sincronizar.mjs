@@ -1,11 +1,19 @@
 // Sincroniza as INTIMAÇÕES pela JulIA (Robô A1) para dentro da tabela `intimacoes` com fonte='julia'.
 // UM login por tribunal, lê as intimações pendentes (SEM ciência) e grava/atualiza. Não repete login em erro.
 // Uso:  node sincronizar.mjs TJPR     (um tribunal)   |   node sincronizar.mjs ALL   (todos os que casam)
+import fs from 'node:fs';
 import pg from 'pg';
 import { login, intimacoes, encerrar, tribunais, temChave } from './robo-a1.mjs';
 
 const ESC = process.env.ESCRITORIO || '8ecf2ba5-6e1d-42e9-95e5-8a556363b2ed'; // HH
-const log = (...a) => console.log(new Date().toISOString(), ...a);
+// Log no console E num arquivo (ler no Console do EasyPanel: tail -n 80 /tmp/movimentacoes-julia.log).
+const ARQ_LOG = process.env.SINC_LOG || '/tmp/movimentacoes-julia.log';
+try { if (fs.statSync(ARQ_LOG).size > 5e6) fs.renameSync(ARQ_LOG, ARQ_LOG + '.old'); } catch { /* ainda não existe */ }
+const log = (...a) => {
+  const linha = new Date().toISOString() + ' ' + a.map((x) => (typeof x === 'string' ? x : String(x))).join(' ');
+  console.log(linha);
+  try { fs.appendFileSync(ARQ_LOG, linha + '\n'); } catch { /* sem disco: segue só no console */ }
+};
 
 const soDigitos = (s) => String(s || '').replace(/\D/g, '');
 const soData = (s) => { const m = String(s || '').match(/^(\d{4}-\d{2}-\d{2})/); return m ? m[1] : null; };

@@ -18,8 +18,8 @@ const log = (...a) => {
 const soDigitos = (s) => String(s || '').replace(/\D/g, '');
 const soData = (s) => { const m = String(s || '').match(/^(\d{4}-\d{2}-\d{2})/); return m ? m[1] : null; };
 const ts = (s) => (s && /\d{4}-\d{2}-\d{2}/.test(String(s))) ? String(s) : null;
-// Código do tribunal ignorando "eproc" e o grau (1G/2G): "Eproc/TJMG" e "TJMG-EPROC" viram "tjmg"; "TRF4-2G" vira "trf4".
-const sigla = (s) => String(s || '').toLowerCase().replace(/eproc/g, '').replace(/[^a-z0-9]/g, '').replace(/[12]g$/, '');
+// Normaliza o nome do autenticador para casar com o contaDoAutenticador do robô (sem acento/pontuação).
+const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
 // "Exequente: X; Executado: Y" (intimação) ou "A X B" (acervo) → [{polo?, nome}]
 function parsePartes(s) {
@@ -45,8 +45,10 @@ async function paresParaRodar(c, esc) {
   const pares = [];
   for (const t of lista) {
     if (!t.loginValidado) continue;
-    const alvoSig = sigla(t.contaDoAutenticador || t.sigla || t.id);
-    const aut = auts.find(a => sigla(a.nome) === alvoSig) || auts.find(a => { const x = sigla(a.nome); return x && alvoSig && (x.includes(alvoSig) || alvoSig.includes(x)); });
+    if (t.sistema === 'pje') continue;                  // os autenticadores da HH (menos PDPJ) são do eProc; o PJe por tribunal pede outro 2FA → evita 422
+    const alvo = norm(t.contaDoAutenticador);
+    if (!alvo) continue;                                // sem autenticador declarado, não arrisca um login com 2FA trocado
+    const aut = auts.find(a => norm(a.nome) === alvo);  // casamento EXATO pelo nome do autenticador
     if (aut && mapa[aut.id]) pares.push({ tribunal: t.id, sigla: t.sigla || t.id, seed: mapa[aut.id], autNome: aut.nome });
   }
   return pares;

@@ -7,6 +7,7 @@ import { login, intimacoes, acervo, encerrar, temChave } from './robo-a1.mjs';
 
 const ESC = process.env.ESCRITORIO || '8ecf2ba5-6e1d-42e9-95e5-8a556363b2ed'; // HH
 const TRIBUNAL = (process.argv[2] || '').trim();
+const AUT_FORCADO = (process.argv[3] || '').trim(); // opcional: nome do autenticador a usar (ex.: "PDPJ"), em vez de casar pela sigla
 const log = (...a) => console.log(...a);
 
 if (!TRIBUNAL) { log('uso: node teste-login.mjs <TRIBUNAL>   (ex.: TJSP)'); process.exit(1); }
@@ -18,11 +19,17 @@ try {
   const s = (await c.query("select integracao_segredo_ler($1,'pje_pfx') pfx, integracao_segredo_ler($1,'pje_senha') senha", [ESC])).rows[0] || {};
   if (!s.pfx || !s.senha) { log('falta A1/senha no cofre da HH'); process.exit(1); }
 
-  // Autenticador que casa com o tribunal (ex.: "TJSP-2G" → casa com o autenticador "TJSP").
+  // Autenticador: o forçado (3º argumento) ou o que casa com o tribunal (ex.: "TJSP-2G" → "TJSP").
   const auts = (await c.query('select id,nome,conta from escritorio_autenticadores where escritorio_id=$1', [ESC])).rows;
-  const base = TRIBUNAL.replace(/[-_].*$/, '').toLowerCase();
-  const aut = auts.find(a => String(a.nome || '').toLowerCase().includes(base)) || auts.find(a => String(a.conta || '').toLowerCase().includes(base));
-  if (!aut) { log(`sem autenticador casando com "${TRIBUNAL}". A HH tem: ${auts.map(a => a.nome).join(', ')}`); process.exit(1); }
+  let aut;
+  if (AUT_FORCADO) {
+    aut = auts.find(a => String(a.nome || '').toLowerCase().includes(AUT_FORCADO.toLowerCase()));
+    if (!aut) { log(`sem autenticador chamado "${AUT_FORCADO}". A HH tem: ${auts.map(a => a.nome).join(', ')}`); process.exit(1); }
+  } else {
+    const base = TRIBUNAL.replace(/[-_].*$/, '').toLowerCase();
+    aut = auts.find(a => String(a.nome || '').toLowerCase().includes(base)) || auts.find(a => String(a.conta || '').toLowerCase().includes(base));
+    if (!aut) { log(`sem autenticador casando com "${TRIBUNAL}". A HH tem: ${auts.map(a => a.nome).join(', ')}`); process.exit(1); }
+  }
   const mapa = (await c.query('select autenticadores_segredos($1) m', [ESC])).rows[0].m || {};
   const seed = mapa[aut.id];
   if (!seed) { log('sem o segredo do autenticador ' + aut.nome); process.exit(1); }

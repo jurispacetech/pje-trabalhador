@@ -42,13 +42,19 @@ async function paresParaRodar(c, esc) {
   const mapa = (await c.query('select autenticadores_segredos($1) m', [esc])).rows[0].m || {};
   const cat = await tribunais();
   const lista = Array.isArray(cat) ? cat : (cat.tribunais || cat.itens || []);
+  const autPdpj = auts.find(a => /pdpj/i.test(a.nome || ''));   // o autenticador nacional (validado no TJPE)
+  // PJe (sistema=pje): usa o PDPJ, mas só nos tribunais onde a HH atua (senão logaria em dezenas sem processo). Ajuste com PJE_TRIBUNAIS.
+  const pjePermitidos = (process.env.PJE_TRIBUNAIS || 'TJPE,TJPI,TRT22,TRF1').split(',').map(s => sigla(s)).filter(Boolean);
   const pares = [];
   for (const t of lista) {
     if (!t.loginValidado) continue;
-    if (t.sistema === 'pje') continue;                  // os autenticadores da HH (menos PDPJ) são do eProc; pular o PJe por tribunal evita o 422 do TJMG
-    const alvo = sigla(t.contaDoAutenticador || t.sigla || t.id);  // muitos eProc vêm sem contaDoAutenticador → usa a sigla/id (TJSP, JFRS→TRF4…)
-    if (!alvo) continue;
-    const aut = auts.find(a => sigla(a.nome) === alvo); // casamento por sigla
+    let aut;
+    if (t.sistema === 'pje') {
+      if (autPdpj && pjePermitidos.includes(sigla(t.sigla || t.id))) aut = autPdpj;       // PJe → autenticador PDPJ
+    } else {
+      const alvo = sigla(t.contaDoAutenticador || t.sigla || t.id);                       // eProc → autenticador do próprio tribunal (TJSP, JFRS→TRF4…)
+      if (alvo) aut = auts.find(a => sigla(a.nome) === alvo);
+    }
     if (aut && mapa[aut.id]) pares.push({ tribunal: t.id, sigla: t.sigla || t.id, seed: mapa[aut.id], autNome: aut.nome });
   }
   return pares;

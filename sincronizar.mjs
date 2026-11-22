@@ -61,12 +61,13 @@ async function paresParaRodar(c, esc) {
 }
 
 const UPSERT = `insert into intimacoes
-  (escritorio_id, chave, numero_processo, tribunal, orgao, classe, tipo, disponibilizada_em, partes, contas_ids, fonte, prazo, fim_do_prazo, limite_ciencia, ciencia_pendente)
-  values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'{}','julia',$10,$11,$12,$13)
+  (escritorio_id, chave, numero_processo, tribunal, orgao, classe, tipo, disponibilizada_em, partes, contas_ids, fonte, prazo, fim_do_prazo, limite_ciencia, ciencia_pendente, id_processo_tribunal)
+  values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'{}','julia',$10,$11,$12,$13,$14)
   on conflict (escritorio_id, chave) do update set
     numero_processo=excluded.numero_processo, tribunal=excluded.tribunal, orgao=excluded.orgao, classe=excluded.classe,
     tipo=excluded.tipo, disponibilizada_em=excluded.disponibilizada_em, partes=excluded.partes,
-    prazo=excluded.prazo, fim_do_prazo=excluded.fim_do_prazo, limite_ciencia=excluded.limite_ciencia, ciencia_pendente=excluded.ciencia_pendente`;
+    prazo=excluded.prazo, fim_do_prazo=excluded.fim_do_prazo, limite_ciencia=excluded.limite_ciencia,
+    ciencia_pendente=excluded.ciencia_pendente, id_processo_tribunal=excluded.id_processo_tribunal`;
 
 async function gravar(c, esc, sigla, it) {
   const chave = it.idExpediente || (soDigitos(it.cnj) + '-' + (it.criadoEm || ''));
@@ -74,7 +75,7 @@ async function gravar(c, esc, sigla, it) {
   await c.query(UPSERT, [
     esc, chave, soDigitos(it.cnj), sigla, it.orgao || null, it.classe || null, it.tipo || null,
     disp, JSON.stringify(parsePartes(it.partes)), it.prazo || null, ts(it.fimDoPrazo), ts(it.limiteCiencia),
-    typeof it.cienciaPendente === 'boolean' ? it.cienciaPendente : null,
+    typeof it.cienciaPendente === 'boolean' ? it.cienciaPendente : null, it.idProcessoTribunal || null,
   ]);
 }
 

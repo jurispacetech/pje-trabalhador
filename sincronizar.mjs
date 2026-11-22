@@ -5,13 +5,13 @@ import pg from 'pg';
 import { login, intimacoes, encerrar, tribunais, temChave } from './robo-a1.mjs';
 
 const ESC = process.env.ESCRITORIO || '8ecf2ba5-6e1d-42e9-95e5-8a556363b2ed'; // HH
-const ALVO = (process.argv[2] || 'ALL').trim().toUpperCase();
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 const soDigitos = (s) => String(s || '').replace(/\D/g, '');
 const soData = (s) => { const m = String(s || '').match(/^(\d{4}-\d{2}-\d{2})/); return m ? m[1] : null; };
 const ts = (s) => (s && /\d{4}-\d{2}-\d{2}/.test(String(s))) ? String(s) : null;
-const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+// Código do tribunal ignorando "eproc" e o grau (1G/2G): "Eproc/TJMG" e "TJMG-EPROC" viram "tjmg"; "TRF4-2G" vira "trf4".
+const sigla = (s) => String(s || '').toLowerCase().replace(/eproc/g, '').replace(/[^a-z0-9]/g, '').replace(/[12]g$/, '');
 
 // "Exequente: X; Executado: Y" (intimação) ou "A X B" (acervo) → [{polo?, nome}]
 function parsePartes(s) {
@@ -37,8 +37,8 @@ async function paresParaRodar(c, esc) {
   const pares = [];
   for (const t of lista) {
     if (!t.loginValidado) continue;
-    const cda = norm(t.contaDoAutenticador);
-    const aut = auts.find(a => norm(a.nome) === cda) || auts.find(a => cda && (norm(a.nome).includes(cda) || cda.includes(norm(a.nome))));
+    const alvoSig = sigla(t.contaDoAutenticador || t.sigla || t.id);
+    const aut = auts.find(a => sigla(a.nome) === alvoSig) || auts.find(a => { const x = sigla(a.nome); return x && alvoSig && (x.includes(alvoSig) || alvoSig.includes(x)); });
     if (aut && mapa[aut.id]) pares.push({ tribunal: t.id, sigla: t.sigla || t.id, seed: mapa[aut.id], autNome: aut.nome });
   }
   return pares;
@@ -75,8 +75,9 @@ async function umTribunal(c, esc, cert, t) {
   } finally { await encerrar(sess.sessao); }
 }
 
-async function main() {
-  if (!temChave()) { log('falta ROBO_A1_KEY'); process.exit(1); }
+export async function sincronizar(alvo = 'ALL') {
+  const ALVO = String(alvo || 'ALL').trim().toUpperCase();
+  if (!temChave()) { log('falta ROBO_A1_KEY'); return; }
   const c = new pg.Client({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
   await c.connect();
   try {
@@ -89,4 +90,8 @@ async function main() {
     log('fim da sincronização');
   } finally { await c.end().catch(() => {}); }
 }
-main().catch(e => { log('sincronização falhou:', e.message); process.exit(1); });
+
+// Rodar direto pela linha de comando: node sincronizar.mjs [TRIBUNAL|ALL]
+if (import.meta.url === `file://${process.argv[1]}`) {
+  sincronizar(process.argv[2] || 'ALL').catch(e => { log('sincronização falhou:', e.message); process.exit(1); });
+}
